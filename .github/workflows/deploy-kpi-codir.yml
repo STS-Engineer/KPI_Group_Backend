@@ -46,7 +46,7 @@ jobs:
           rm -rf backend/.git
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_4158BA5D0AEC4DEFAE2A622C57B7A2AE }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - uses: azure/webapps-deploy@v3
