@@ -4,9 +4,13 @@ on:
 permissions:
   contents: read
   id-token: write
+concurrency:
+  group: deploy-kpi-codir
+  cancel-in-progress: false
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -14,7 +18,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: STS-Engineer/KPI_Group_Frontend
-          token: ${{ secrets.KPI_FRONTEND_READ_TOKEN }}
           path: frontend
       - uses: actions/setup-node@v4
         with:
@@ -40,6 +43,7 @@ jobs:
           mkdir -p backend/frontend-dist
           cp -a frontend/dist/. backend/frontend-dist/
           test -f backend/frontend-dist/index.html
+          rm -rf backend/.git
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -49,3 +53,4 @@ jobs:
         with:
           app-name: kpi-codir
           package: backend
+          startup-command: npm start
