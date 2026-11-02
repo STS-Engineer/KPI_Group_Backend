@@ -33,6 +33,20 @@ const { loadAuthConfig } = require("./config/auth");
 const { installAuth } = require("./installAuth");
 const { createKpiIntakeService } = require("./services/kpiIntake.service");
 const { createKpiIntakeRouter } = require("./routes/kpiIntake.routes");
+const { createKpiAnalyticsScope } = require("./services/kpiAnalyticsScope.service");
+const { createAppAssistant } = require("./services/appAssistant.service");
+const { createAppAssistantTools } = require("./services/appAssistantTools.service");
+const { createAppAssistantRouter } = require("./routes/appAssistant.routes");
+const { loadActionPlanCorrectiveActionMaps } = require("./services/actionPlan.service");
+const { loadKpiTrainingPortalRows, buildTrainingPortalAssignment } = require("./services/kpiTraining.service");
+const {
+  loadKpiKnowledgeBaseForAssistant,
+  buildStoredKpiKnowledgeBaseContext
+} = require("./services/kpiAssistant.service");
+const {
+  normalizeCorrectiveActionStatus,
+  CLOSED_CORRECTIVE_ACTION_STATUS
+} = require("./services/kpiShared.service");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -78,6 +92,67 @@ app.use(miscRoutes);
 app.use(targetAdjustmentsRoutes);
 app.use(createKpiIntakeRouter({ kpiIntake }));
 
+// AI Assistant (chat button of the React app): reads live KPI data through
+// scoped, read-only tools. KPI_ASSISTANT_MODEL picks the OpenAI model.
+const appAssistant = createAppAssistant({
+  db: pool,
+  getOpenAIClient,
+  model: process.env.KPI_ASSISTANT_MODEL,
+  tools: createAppAssistantTools({
+    db: pool,
+    analyticsScope: createKpiAnalyticsScope({ db: pool }),
+    loadCorrectiveActions: async (allocationRows) => {
+      const { historyByAllocationId } = await loadActionPlanCorrectiveActionMaps(allocationRows);
+      return Object.values(historyByAllocationId)
+        .flat()
+        .map((action) => ({
+          id: action.id,
+          kpi_target_allocation_id: action.kpi_target_allocation_id,
+          period_label: action.period_label,
+          root_cause: action.root_cause,
+          implemented_solution: action.implemented_solution,
+          owner: action.responsible,
+          status: action.status,
+          is_closed: normalizeCorrectiveActionStatus(action.status) === CLOSED_CORRECTIVE_ACTION_STATUS,
+          due_date: action.due_date,
+          importance: action.importance,
+          urgency: action.urgency,
+          created_date: action.created_date,
+          closed_date: action.closed_date
+        }));
+    },
+    loadTrainingAssignments: async (peopleId) =>
+      (await loadKpiTrainingPortalRows({ peopleId })).map((row) => {
+        const assignment = buildTrainingPortalAssignment(row);
+        return {
+          kpi: assignment.kpi?.name,
+          status: assignment.status,
+          training_completed: assignment.progress?.training_completed,
+          test_available: assignment.progress?.test_available,
+          test_completed: assignment.progress?.test_completed,
+          score: assignment.score,
+          passed: assignment.passed,
+          due_date: assignment.due_date,
+          escalation_level: assignment.escalation_level,
+          next_reminder: assignment.next_reminder_due_at
+        };
+      }),
+    loadKpiKnowledge: async ({ kpiId, question }) => {
+      const kpiRow = await loadKpiKnowledgeBaseForAssistant(kpiId);
+      if (!kpiRow) return null;
+      const context = buildStoredKpiKnowledgeBaseContext({
+        knowledgeBase: kpiRow.kpi_knowledge_base,
+        message: question || kpiRow.kpi_name || "",
+        conversationHistory: [],
+        selectedKpiSummary: null,
+        selectedKpi: { kpi_id: kpiRow.kpi_id, title: kpiRow.kpi_name, subtitle: kpiRow.kpi_sub_title }
+      });
+      return { kpi_id: kpiRow.kpi_id, kpi: kpiRow.kpi_name, ...context };
+    }
+  })
+});
+app.use(createAppAssistantRouter({ appAssistant }));
+
 registerRecommendationRoutes(app, pool, createTransporter);
 registerAIGeneratedKpiRoutes(app, {
   pool,
@@ -103,9 +178,13 @@ authService
   .ensureSchema()
   .then(() => {
     console.log("[Auth] User and session tables are ready.");
+    // Its conversations belong to the accounts (kpi_app_user).
+    return appAssistant.ensureSchema().then(() => {
+      console.log("[AI Assistant] Conversation table is ready.");
+    });
   })
   .catch((error) => {
-    console.error("[Auth] Schema setup failed:", error.message);
+    console.error("[Auth / AI Assistant] Schema setup failed:", error.message);
   });
 
 kpiChangeLog

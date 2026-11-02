@@ -2,8 +2,8 @@
 // a signed-in user.
 //
 // Only the Responsible KPI Dashboard (/responsible/:id/dashboard), the user
-// administration and the rows of the database shown on the KPI & Target Intake
-// page require an account. A user only opens their own dashboard:
+// administration, the rows of the database shown on the KPI & Target Intake
+// page and the saved AI Assistant conversations require an account. A user only opens their own dashboard:
 // :id must be the people_id of their account (administrators open any). Every other page -- in particular the
 // ones opened from e-mail links (/form, /dashboard, /kpi-training-center,
 // /kpi-target-adjustments/review...) -- stays open exactly as before, so the
@@ -25,6 +25,8 @@ const PROTECTED_ROUTES = [
   /^\/api\/responsibles\/[^/]+\/kpi-history-monthly$/,
   // KPI & Target Intake page: the rows already in the database (the rest of the page is public)
   /^\/api\/kpi-intake\/records$/,
+  // AI Assistant: the saved conversations of the signed-in user (the chat itself is public)
+  /^\/api\/assistant\/conversations(\/[^/]+)?$/,
   // User administration
   /^\/api\/admin(\/|$)/
 ];

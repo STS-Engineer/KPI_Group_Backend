@@ -78,6 +78,22 @@ ligne existante n'est modifiée.
 | Écritures publiques | `GET /api/kpi-intake/lookups`, `/people`, `/customers`, `/lines`, `POST /api/kpi-intake/lines`, `DELETE /api/kpi-intake/lines/:id` : limitées par IP (600 lectures et 120 écritures par 15 min), 2 Mo et 200 lignes au maximum par enregistrement. Une ligne modifiée par quelqu'un d'autre entre-temps est refusée (409, `row_version`). |
 | Administrateur | `GET /api/admin/kpi-intake/preview` (aperçu, n'écrit rien), `POST /api/admin/kpi-intake/submit` (`intake_ids` optionnel), `POST /api/admin/kpi-intake/reject` (`intake_ids`, `comment`). Le Submit s'exécute en une seule transaction, sous un verrou consultatif : si une ligne échoue, rien n'est inséré. Les créations sont tracées dans `kpi_app_change_log` (source `intake`) et la base de connaissance des KPI est mise à jour. |
 
+## Assistant IA (bouton « AI » de toutes les pages)
+
+Un bouton en bas à droite de chaque page du frontend ouvre un chat. L'assistant
+explique les boards et les règles KPI, et lit les données réelles de
+l'utilisateur connecté par appel de fonctions OpenAI (streaming).
+
+| Sujet | Règle |
+|---|---|
+| Accès | `POST /api/assistant/chat` est public, comme les pages. Sans session : explication de l'application et du catalogue KPI seulement (outil `find_kpis`), rien n'est enregistré. Avec session : ses KPI, et ceux de son périmètre pour plant / zone manager, VP, CEO et admin — la même règle que « My KPI Analytics » (`kpiAnalyticsScope.service.js`), appliquée dans le code des outils, jamais par le prompt. |
+| Outils (lecture seule) | `services/appAssistantTools.service.js` : dernier résultat et statut de chaque allocation, historique mensuel d'un KPI, target allocations, actions correctives (base Action Plan), base de connaissance d'un KPI, formations de l'utilisateur, personnes du périmètre. Le statut (on / off target) est calculé comme sur le dashboard (`getDashboardSubmissionStatus`). Aucun outil n'écrit. |
+| Connaissance | `services/appAssistantKnowledge.js` : la liste des boards (liens, accès, mode d'emploi), les règles KPI, la page où se trouve l'utilisateur. À mettre à jour quand un board change. |
+| Conversations | `kpi_app_assistant_conversation` (créée au démarrage, supprimée avec le compte). `GET /api/assistant/conversations[/:id]` et `DELETE …/:id` sont des routes protégées : chacun ne voit que les siennes. |
+| Réponse | Flux SSE : `tool` (recherche en cours / terminée), `delta` (texte), puis `done` (`conversation_id`, `answer`, `suggestions`) ou `error`. Bouton Stop : la partie déjà écrite est conservée. |
+| Limites | 60 questions par compte et 20 par IP sans session, par 15 minutes ; 4 000 caractères par question ; 5 tours d'outils au plus par réponse. |
+| Modèle | `KPI_ASSISTANT_MODEL` (défaut `gpt-4o-mini`), clé `SECRET_KEY` comme le reste de l'application. |
+
 ### Tests
 
 `npm test` lance les tests du parcours complet sur une base PostgreSQL en
