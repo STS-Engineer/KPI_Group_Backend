@@ -54,3 +54,14 @@ jobs:
           app-name: kpi-codir
           package: backend
           startup-command: npm start
+
+      - name: Verify production HTTP responses
+        shell: bash
+        run: |
+          base_url="https://kpi-codir.azurewebsites.net"
+          for route in / /login /api/auth/me /api/kpis; do
+            curl --fail --silent --show-error --retry 18 --retry-all-errors --retry-delay 5 --retry-max-time 180 --max-time 30 \
+              --output "$RUNNER_TEMP/kpi-response" "$base_url$route"
+            echo "HTTP 200: $route"
+          done
+          python -c 'import json,os; data=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"kpi-response"))); assert isinstance(data,list), "KPI API must return a JSON list"; print("KPI API JSON verified; records:",len(data))'
