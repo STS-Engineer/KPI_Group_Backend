@@ -1,0 +1,51 @@
+name: Deploy combined KPI application
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: backend
+      - uses: actions/checkout@v4
+        with:
+          repository: STS-Engineer/KPI_Group_Frontend
+          token: ${{ secrets.KPI_FRONTEND_READ_TOKEN }}
+          path: frontend
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
+        env:
+          VITE_API_URL: '/'
+      - name: Test backend
+        working-directory: backend
+        env:
+          DISABLE_CRON_JOBS: 'true'
+        run: |
+          npm ci
+          npm test
+      - name: Assemble
+        run: |
+          mkdir -p backend/frontend-dist
+          cp -a frontend/dist/. backend/frontend-dist/
+          test -f backend/frontend-dist/index.html
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/webapps-deploy@v3
+        with:
+          app-name: kpi-codir
+          package: backend

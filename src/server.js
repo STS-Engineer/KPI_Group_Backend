@@ -49,6 +49,14 @@ const {
 } = require("./services/kpiShared.service");
 
 const app = express();
+
+// Serve the Vite production build from the same origin as the API.
+// The deployment workflow places frontend/dist under frontend-dist.
+const path = require("path");
+const fs = require("fs");
+const frontendDist = path.join(__dirname, "..", "frontend-dist");
+const frontendIndex = path.join(frontendDist, "index.html");
+
 const port = process.env.PORT || 5000;
 const authConfig = loadAuthConfig();
 
@@ -212,5 +220,17 @@ ensureKpiTrainingEscalationSchema()
   .catch((error) => {
     console.error("[KPI Training Reminder] Escalation tracking setup failed:", error.message);
   });
+
+// API routes have priority. Never return HTML for unknown /api paths.
+if (fs.existsSync(frontendIndex)) {
+  app.use(express.static(frontendDist, { index: false }));
+  app.get("*", (req, res, next) => {
+    if (req.path === "/api" || req.path.startsWith("/api/")) return next();
+    if (req.method !== "GET") return next();
+    return res.sendFile(frontendIndex);
+  });
+} else {
+  console.warn("[Frontend] frontend-dist/index.html missing; API-only mode.");
+}
 
 app.listen(port, () => console.log("Server running on port " + port));
