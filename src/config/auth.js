@@ -11,11 +11,26 @@ const parseOriginList = (value) =>
     .map((origin) => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 
+// "Continue with Microsoft" (Entra ID app registration "KPI Manager"). Only
+// from the environment, never hardcoded: without all four values the button
+// is hidden and the Microsoft routes answer "not configured".
+const loadMicrosoftConfig = (env) => {
+  const value = (name) => String(env[name] || "").trim();
+  const microsoft = {
+    tenantId: value("AZURE_TENANT_ID"),
+    clientId: value("AZURE_CLIENT_ID"),
+    clientSecret: value("AZURE_CLIENT_SECRET"),
+    redirectUri: value("AZURE_REDIRECT_URI")
+  };
+  return { ...microsoft, enabled: Object.values(microsoft).every(Boolean) };
+};
+
 const loadAuthConfig = (env = process.env) => {
   const allowedOrigins = parseOriginList(env.FRONTEND_URL || "http://localhost:5173");
   const sameSite = String(env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase();
 
   return {
+    microsoft: loadMicrosoftConfig(env),
     cookieName: "kpi_session",
     // Browsers only accept SameSite=None together with Secure.
     cookieSecure: sameSite === "none" || parseBooleanEnv(env.AUTH_COOKIE_SECURE, env.NODE_ENV === "production"),

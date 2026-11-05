@@ -10,10 +10,23 @@ const {
   hashToken
 } = require("../utils/password");
 const { buildInvitationEmail, buildPasswordResetEmail } = require("./authEmail.templates");
+const { createPeopleDirectory } = require("./peopleDirectory.service");
+const { getEmailCandidates } = require("./microsoftAuth.service");
 
 const { USER_ROLES } = model;
 const SESSION_TOUCH_INTERVAL_MS = 60 * 1000;
 const MAX_RESET_REQUESTS_PER_HOUR = 3;
+
+// Sign in with Microsoft: someone without an account gets one at their first
+// Microsoft sign-in when the role of their assignments is in this list (set
+// from the administration; "admin" is never given automatically).
+const MICROSOFT_SETTINGS_KEY = "microsoft_sign_in";
+const MICROSOFT_ROLE_CHOICES = ["ceo", "vp", "zone_manager", "plant_manager", "user"];
+const DEFAULT_MICROSOFT_AUTO_CREATE_ROLES = ["ceo", "vp", "zone_manager", "plant_manager"];
+
+// code: what the sign-in page tells the user (see the Microsoft callback route).
+const createMicrosoftError = (code, message, details = {}) =>
+  Object.assign(createHttpError(403, message), { code, details });
 
 const INVALID_CREDENTIALS_MESSAGE = "Incorrect e-mail or password.";
 const TOO_MANY_ATTEMPTS_MESSAGE =
@@ -51,7 +64,8 @@ const assertPasswordPolicy = (password, email) => {
 const getUserStatus = (row, now) => {
   if (!row.is_active) return "disabled";
   if (row.locked_until && new Date(row.locked_until) > now) return "locked";
-  if (!row.password_hash) return "invited";
+  // A Microsoft account signs in without a password: not an invitation.
+  if (!row.password_hash && !row.microsoft_oid) return "invited";
   if (row.must_change_password) return "password_change_required";
   return "active";
 };
@@ -68,11 +82,17 @@ const toSessionUser = (row) => ({
 });
 
 // What an administrator sees in the user list (never the password hash).
-const toAdminUser = (row, now) => ({
+// orgRole: the role the person's assignments give ({ role, label }), if known.
+const toAdminUser = (row, now, orgRole = null) => ({
   ...toSessionUser(row),
   is_active: Boolean(row.is_active),
   status: getUserStatus(row, now),
   has_password: Boolean(row.password_hash),
+  has_microsoft: Boolean(row.microsoft_oid),
+  microsoft_linked_at: toIso(row.microsoft_linked_at),
+  created_via: row.created_via || "admin",
+  last_login_method: row.last_login_method || null,
+  org_role: orgRole,
   failed_login_count: Number(row.failed_login_count || 0),
   locked_until: toIso(row.locked_until),
   password_changed_at: toIso(row.password_changed_at),
@@ -89,7 +109,14 @@ const toAdminUser = (row, now) => ({
     : null
 });
 
-const createAuthService = ({ db, sendMail, config, now = () => new Date(), logger = console }) => {
+const createAuthService = ({
+  db,
+  sendMail,
+  config,
+  now = () => new Date(),
+  logger = console,
+  peopleDirectory = createPeopleDirectory({ db })
+}) => {
   let schemaPromise = null;
   let dummyHashPromise = null;
   const pendingDeliveries = new Set();
@@ -207,6 +234,22 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
     return { peopleId, person };
   };
 
+  // The role each linked person's assignments give; null when they cannot be
+  // read (the list of accounts still loads without them).
+  const loadOrgRoles = async (peopleIds) => {
+    try {
+      return await peopleDirectory.getOrgRoles(peopleIds.filter(Boolean));
+    } catch (error) {
+      logger.error("[Auth] Failed to read the role assignments:", error.message);
+      return null;
+    }
+  };
+
+  const orgRoleOf = (orgRoles, peopleId) => {
+    if (!orgRoles || !peopleId) return null;
+    return orgRoles.get(Number(peopleId)) || { role: "user", label: null };
+  };
+
   const assertKeepsAnActiveAdmin = async (target, { nextRole, nextActive }) => {
     const losesAdmin = target.role === "admin" && target.is_active && (nextRole !== "admin" || !nextActive);
     if (!losesAdmin) return;
@@ -216,6 +259,26 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
   };
 
   // ---- authentication ------------------------------------------------------
+
+  // A new session for a user who proved who they are (method: "password" or
+  // "microsoft"); details are added to the login.success event.
+  const startSession = async (user, meta, method, details = {}) => {
+    const currentTime = now();
+    const token = generateToken();
+    const expiresAt = new Date(currentTime.getTime() + config.sessionTtlMs);
+    await model.insertSession(db, {
+      userId: user.user_id,
+      tokenHash: hashToken(token),
+      expiresAt,
+      ipAddress: meta.ipAddress ? String(meta.ipAddress).slice(0, 64) : null,
+      userAgent: meta.userAgent ? String(meta.userAgent).slice(0, 512) : null,
+      now: currentTime
+    });
+    await model.registerSuccessfulLogin(db, user.user_id, currentTime, method);
+    await logEvent("login.success", { user, meta, details: { method, ...details } });
+
+    return { user: toSessionUser({ ...user, last_login_at: currentTime }), token, expiresAt };
+  };
 
   const login = async ({ email, password }, meta = {}) => {
     await ensureSchema();
@@ -261,20 +324,199 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
       throw createHttpError(403, "This account is disabled. Contact an administrator.");
     }
 
-    const token = generateToken();
-    const expiresAt = new Date(currentTime.getTime() + config.sessionTtlMs);
-    await model.insertSession(db, {
-      userId: user.user_id,
-      tokenHash: hashToken(token),
-      expiresAt,
-      ipAddress: meta.ipAddress ? String(meta.ipAddress).slice(0, 64) : null,
-      userAgent: meta.userAgent ? String(meta.userAgent).slice(0, 512) : null,
-      now: currentTime
-    });
-    await model.registerSuccessfulLogin(db, user.user_id, currentTime);
-    await logEvent("login.success", { user, meta });
+    return startSession(user, meta, "password");
+  };
 
-    return { user: toSessionUser({ ...user, last_login_at: currentTime }), token, expiresAt };
+  // ---- sign in with Microsoft ----------------------------------------------
+
+  const readMicrosoftSettings = async () => {
+    const row = await model.getSetting(db, MICROSOFT_SETTINGS_KEY);
+    const saved = row?.value?.auto_create_roles;
+    return {
+      auto_create_roles: Array.isArray(saved)
+        ? MICROSOFT_ROLE_CHOICES.filter((role) => saved.includes(role))
+        : DEFAULT_MICROSOFT_AUTO_CREATE_ROLES,
+      updated_at: toIso(row?.updated_at),
+      updated_by_user_id: row?.updated_by_user_id || null
+    };
+  };
+
+  // First Microsoft sign-in of a person without an account: an account linked
+  // to the person and to the Microsoft account, with the role of their
+  // assignments, and no password.
+  const createMicrosoftAccount = async ({ person, orgRole, microsoftOid, claims, matchedEmail }, meta) => {
+    const email = normalizeEmail(person.email) || matchedEmail;
+    const fullName = getPersonDisplayName(person) || normalizeName(claims.name) || email;
+    try {
+      const user = await model.insertUser(db, {
+        email,
+        fullName,
+        peopleId: person.people_id,
+        role: orgRole.role,
+        passwordHash: null,
+        mustChangePassword: false,
+        createdByUserId: null,
+        createdVia: "microsoft",
+        microsoftOid,
+        now: now()
+      });
+      await logEvent("user.created", {
+        user,
+        meta,
+        details: { role: orgRole.role, mode: "microsoft", org_role_label: orgRole.label }
+      });
+      return user;
+    } catch (error) {
+      // Two first sign-ins at the same time: the other one created it.
+      if (error.code !== "23505") throw error;
+      const existing = (await model.findUserByMicrosoftOid(db, microsoftOid)) || (await model.findUserByPeopleId(db, person.people_id));
+      if (!existing) throw error;
+      return existing;
+    }
+  };
+
+  // claims: the ID token of the Microsoft account (microsoftAuth.completeSignIn).
+  // An existing account -- found by its Microsoft link, its e-mail or its
+  // person -- signs in whatever its role; someone without one gets an account
+  // when the role of their assignments is allowed (settings). A temporary
+  // password is dropped: the account no longer has a password anyone knows.
+  const signInWithMicrosoft = async ({ claims = {} }, meta = {}) => {
+    await ensureSchema();
+    const microsoftOid = String(claims.oid || "").trim().slice(0, 64);
+    const emails = getEmailCandidates(claims).map(normalizeEmail).filter(Boolean);
+
+    const refuse = async (code, message, { user = null, details = {} } = {}) => {
+      await logEvent("login.failure", {
+        user,
+        email: user?.email || emails[0] || null,
+        meta,
+        details: { method: "microsoft", reason: code, ...details }
+      });
+      return createMicrosoftError(code, message, details);
+    };
+
+    if (!microsoftOid || !emails.length) {
+      throw await refuse("microsoft_incomplete", "Microsoft did not return your account details. Please try again.");
+    }
+
+    let user = await model.findUserByMicrosoftOid(db, microsoftOid);
+    for (const email of emails) {
+      if (user) break;
+      user = await model.findUserByEmail(db, email);
+    }
+    let person = null;
+    let matchedEmail = null;
+    if (!user) {
+      for (const email of emails) {
+        person = await peopleDirectory.findPersonByEmail(email);
+        if (person) {
+          matchedEmail = email;
+          break;
+        }
+      }
+      if (person) user = await model.findUserByPeopleId(db, person.people_id);
+    }
+
+    let created = false;
+    if (user) {
+      if (user.microsoft_oid && user.microsoft_oid !== microsoftOid) {
+        throw await refuse(
+          "linked_to_other_microsoft_account",
+          "This KPI Manager account is linked to another Microsoft account. Ask an administrator.",
+          { user }
+        );
+      }
+      if (!user.is_active) {
+        throw await refuse("disabled", "This account is disabled. Contact an administrator.", { user });
+      }
+      const linkedPerson = user.people_id ? person || (await peopleDirectory.getPerson(user.people_id)) : null;
+      if (linkedPerson && !linkedPerson.active) {
+        throw await refuse("person_inactive", "You are no longer listed as an active employee. Contact an administrator.", {
+          user
+        });
+      }
+
+      const currentTime = now();
+      if (!user.microsoft_oid) {
+        await model.setMicrosoftLink(db, user.user_id, { microsoftOid, now: currentTime });
+        await logEvent("user.microsoft_linked", { user, meta });
+      }
+      if (user.must_change_password) {
+        await model.clearUserPassword(db, user.user_id, currentTime);
+        await model.invalidateUserPasswordTokens(db, user.user_id, currentTime);
+        await logEvent("password.temporary_removed", { user, meta, details: { method: "microsoft" } });
+      }
+      user = await model.findUserById(db, user.user_id);
+    } else {
+      if (!person) {
+        throw await refuse("no_account", "No KPI Manager account matches your Microsoft account. Ask an administrator.");
+      }
+      if (!person.active) {
+        throw await refuse("person_inactive", "You are no longer listed as an active employee. Contact an administrator.", {
+          details: { people_id: person.people_id }
+        });
+      }
+      const orgRole = await peopleDirectory.getOrgRole(person.people_id);
+      const { auto_create_roles: allowedRoles } = await readMicrosoftSettings();
+      if (!allowedRoles.includes(orgRole.role)) {
+        throw await refuse(
+          "role_not_allowed",
+          "Your role cannot open a KPI Manager account with Microsoft. Ask an administrator for an account.",
+          { details: { people_id: person.people_id, org_role: orgRole.role, org_role_label: orgRole.label } }
+        );
+      }
+      user = await createMicrosoftAccount({ person, orgRole, microsoftOid, claims, matchedEmail }, meta);
+      created = true;
+    }
+
+    return { ...(await startSession(user, meta, "microsoft", created ? { account_created: true } : {})), created };
+  };
+
+  const getMicrosoftSettings = async () => {
+    await ensureSchema();
+    const settings = await readMicrosoftSettings();
+    const updatedBy = settings.updated_by_user_id ? await model.findUserById(db, settings.updated_by_user_id) : null;
+    return {
+      enabled: Boolean(config.microsoft?.enabled),
+      role_choices: MICROSOFT_ROLE_CHOICES,
+      auto_create_roles: settings.auto_create_roles,
+      updated_at: settings.updated_at,
+      updated_by: updatedBy ? { full_name: updatedBy.full_name, email: updatedBy.email } : null
+    };
+  };
+
+  const updateMicrosoftSettings = async (actor, input = {}, meta = {}) => {
+    await ensureSchema();
+    if (!Array.isArray(input.auto_create_roles)) throw createHttpError(400, "Choose the roles as a list.");
+    const requested = input.auto_create_roles.map((role) => String(role).trim().toLowerCase());
+    const invalid = requested.filter((role) => !MICROSOFT_ROLE_CHOICES.includes(role));
+    if (invalid.length) throw createHttpError(400, `These roles cannot be chosen: ${invalid.join(", ")}.`);
+
+    const before = await readMicrosoftSettings();
+    const roles = MICROSOFT_ROLE_CHOICES.filter((role) => requested.includes(role));
+    await model.saveSetting(db, {
+      key: MICROSOFT_SETTINGS_KEY,
+      value: { auto_create_roles: roles },
+      userId: actor.user_id,
+      now: now()
+    });
+    await logEvent("settings.updated", {
+      actor,
+      meta,
+      details: { setting: MICROSOFT_SETTINGS_KEY, auto_create_roles: { from: before.auto_create_roles, to: roles } }
+    });
+    return getMicrosoftSettings();
+  };
+
+  // The next Microsoft sign-in links the account again (by its e-mail): for a
+  // person whose Microsoft account was replaced.
+  const unlinkMicrosoft = async (actor, userId, meta = {}) => {
+    await ensureSchema();
+    const target = await requireUser(userId);
+    if (!target.microsoft_oid) throw createHttpError(400, "This account is not linked to a Microsoft account.");
+    await model.setMicrosoftLink(db, target.user_id, { microsoftOid: null, now: now() });
+    await logEvent("user.microsoft_unlinked", { user: target, actor, meta });
+    return getUser(target.user_id);
   };
 
   const getSession = async (token) => {
@@ -417,7 +659,8 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
       role: normalizedRole,
       now: currentTime
     });
-    const users = rows.map((row) => toAdminUser(row, currentTime));
+    const orgRoles = await loadOrgRoles(rows.map((row) => row.people_id));
+    const users = rows.map((row) => toAdminUser(row, currentTime, orgRoleOf(orgRoles, row.people_id)));
     return status ? users.filter((user) => user.status === status) : users;
   };
 
@@ -425,9 +668,10 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
     await ensureSchema();
     const user = await requireUser(userId);
     const currentTime = now();
-    const [counters, person] = await Promise.all([
+    const [counters, person, orgRoles] = await Promise.all([
       model.getUserCounters(db, user.user_id, currentTime),
-      user.people_id ? model.findPersonById(db, user.people_id) : null
+      user.people_id ? model.findPersonById(db, user.people_id) : null,
+      loadOrgRoles([user.people_id])
     ]);
     return toAdminUser(
       {
@@ -437,7 +681,8 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
         person_name: person?.name,
         person_email: person?.email
       },
-      currentTime
+      currentTime,
+      orgRoleOf(orgRoles, user.people_id)
     );
   };
 
@@ -553,13 +798,14 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
     });
   };
 
-  // Invitation link while the user never chose a password, reset link afterwards.
+  // Invitation link while the user never signed in (no password, no Microsoft
+  // account), reset link afterwards -- also to give a Microsoft account a password.
   const sendPasswordLink = async (actor, userId, meta = {}) => {
     await ensureSchema();
     const target = await requireUser(userId);
     if (!target.is_active) throw createHttpError(400, "Enable the account before sending a link.");
 
-    const purpose = target.password_hash ? "reset" : "invite";
+    const purpose = target.password_hash || target.microsoft_oid ? "reset" : "invite";
     const delivery = await createAndSendPasswordLink(target, purpose, actor);
     await logEvent("user.password_link_sent", {
       user: target,
@@ -642,6 +888,10 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
   return {
     ensureSchema,
     login,
+    signInWithMicrosoft,
+    getMicrosoftSettings,
+    updateMicrosoftSettings,
+    unlinkMicrosoft,
     getSession,
     logout,
     changePassword,
@@ -666,6 +916,8 @@ const createAuthService = ({ db, sendMail, config, now = () => new Date(), logge
 
 module.exports = {
   USER_ROLES,
+  MICROSOFT_ROLE_CHOICES,
+  DEFAULT_MICROSOFT_AUTO_CREATE_ROLES,
   createAuthService,
   normalizeEmail,
   getUserStatus

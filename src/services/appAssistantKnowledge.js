@@ -181,9 +181,10 @@ const APP_BOARDS = [
     link: "/admin/users",
     access: "administrators only",
     summary:
-      "Accounts (invite, edit role, link to a person, disable, unlock, reset password, sessions) and the KPI audit trail of every change made to KPIs and allocations in this app.",
+      "Accounts (invite, edit role, link to a person, disable, unlock, reset password, sessions, sign-in method: password and/or Microsoft), the KPI audit trail of every change made to KPIs and allocations in this app, and the Microsoft sign-in settings.",
     how_to: [
-      "Roles: user (own KPIs), plant_manager, zone_manager, vp, ceo, admin (only admins manage accounts)."
+      "Roles: user (own KPIs), plant_manager, zone_manager, vp, ceo, admin (only admins manage accounts).",
+      "Microsoft sign-in tab: the roles (from the person's role assignments) that get an account automatically at their first \"Continue with Microsoft\"."
     ]
   },
   {
@@ -193,7 +194,7 @@ const APP_BOARDS = [
     link: "/login",
     access: "open",
     summary:
-      "Sign in with the e-mail and password of your account (an administrator creates it and sends an invitation). Forgot password sends a reset link; Change password signs out your other devices.",
+      "Sign in with the e-mail and password of your account (an administrator creates it and sends an invitation), or with \"Continue with Microsoft\" (your AVOCarbon Microsoft account; CEO, VP, plant and zone managers without an account get one automatically). Forgot password sends a reset link; Change password signs out your other devices.",
     how_to: []
   }
 ];

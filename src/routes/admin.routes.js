@@ -87,6 +87,30 @@ const createAdminRouter = ({ authService, requireAdmin, kpiChangeLog, kpiIntake 
   );
 
   router.post(
+    "/api/admin/users/:userId/unlink-microsoft",
+    handle("POST /api/admin/users/:userId/unlink-microsoft", async (req, res) => {
+      res.json({ user: await authService.unlinkMicrosoft(req.auth.user, req.params.userId, getRequestMeta(req)) });
+    })
+  );
+
+  // "Continue with Microsoft": the roles that get an account at their first sign-in.
+  router.get(
+    "/api/admin/settings/microsoft-sign-in",
+    handle("GET /api/admin/settings/microsoft-sign-in", async (_req, res) => {
+      res.json({ settings: await authService.getMicrosoftSettings() });
+    })
+  );
+
+  router.put(
+    "/api/admin/settings/microsoft-sign-in",
+    handle("PUT /api/admin/settings/microsoft-sign-in", async (req, res) => {
+      res.json({
+        settings: await authService.updateMicrosoftSettings(req.auth.user, req.body || {}, getRequestMeta(req))
+      });
+    })
+  );
+
+  router.post(
     "/api/admin/users/:userId/unlock",
     handle("POST /api/admin/users/:userId/unlock", async (req, res) => {
       res.json({ user: await authService.unlockUser(req.auth.user, req.params.userId, getRequestMeta(req)) });

@@ -2,7 +2,7 @@
 // takes the database handle (pg Pool or client) as its first argument so the
 // module can run against the production pool or an in-memory test database.
 //
-// The module owns four new tables (kpi_app_*). It never writes to the existing
+// The module owns its own tables (kpi_app_*). It never writes to the existing
 // tables: public.people is only read, to link an account to a person.
 
 // Account roles. "admin" manages the accounts; the others set how far a user
@@ -72,7 +72,24 @@ const AUTH_SCHEMA_STATEMENTS = [
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )
   `,
-  `CREATE INDEX IF NOT EXISTS kpi_app_auth_event_created_idx ON public.kpi_app_auth_event (created_at)`
+  `CREATE INDEX IF NOT EXISTS kpi_app_auth_event_created_idx ON public.kpi_app_auth_event (created_at)`,
+  // Sign in with Microsoft: the Microsoft account (Entra ID object id) linked
+  // to the account, how the account was created (by an administrator or by a
+  // first Microsoft sign-in) and how it last signed in (password / microsoft).
+  `ALTER TABLE public.kpi_app_user ADD COLUMN IF NOT EXISTS microsoft_oid VARCHAR(64) NULL`,
+  `ALTER TABLE public.kpi_app_user ADD COLUMN IF NOT EXISTS microsoft_linked_at TIMESTAMPTZ NULL`,
+  `ALTER TABLE public.kpi_app_user ADD COLUMN IF NOT EXISTS created_via VARCHAR(20) NOT NULL DEFAULT 'admin'`,
+  `ALTER TABLE public.kpi_app_user ADD COLUMN IF NOT EXISTS last_login_method VARCHAR(20) NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS kpi_app_user_microsoft_oid_idx ON public.kpi_app_user (microsoft_oid)`,
+  // Settings of the module changed from the administration (JSON per key).
+  `
+  CREATE TABLE IF NOT EXISTS public.kpi_app_setting (
+    setting_key VARCHAR(64) PRIMARY KEY,
+    value JSONB NOT NULL,
+    updated_by_user_id INTEGER NULL REFERENCES public.kpi_app_user(user_id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+  `
 ];
 
 const ensureAuthSchema = async (db) => {
@@ -96,7 +113,11 @@ const USER_COLUMNS = `
   u.password_changed_at,
   u.created_by_user_id,
   u.created_at,
-  u.updated_at
+  u.updated_at,
+  u.microsoft_oid,
+  u.microsoft_linked_at,
+  u.created_via,
+  u.last_login_method
 `;
 
 const findUserByEmail = async (db, email) => {
@@ -123,14 +144,28 @@ const findUserByPeopleId = async (db, peopleId) => {
   return result.rows[0] || null;
 };
 
-const insertUser = async (db, { email, fullName, peopleId, role, passwordHash, mustChangePassword, createdByUserId, now }) => {
+const findUserByMicrosoftOid = async (db, microsoftOid) => {
+  const result = await db.query(
+    `SELECT ${USER_COLUMNS} FROM public.kpi_app_user u WHERE u.microsoft_oid = $1`,
+    [microsoftOid]
+  );
+  return result.rows[0] || null;
+};
+
+// createdVia: "admin" (created from the administration or the setup script),
+// "microsoft" (created by a first Microsoft sign-in, already linked to it).
+const insertUser = async (
+  db,
+  { email, fullName, peopleId, role, passwordHash, mustChangePassword, createdByUserId, createdVia = "admin", microsoftOid = null, now }
+) => {
   const result = await db.query(
     `
     INSERT INTO public.kpi_app_user (
       email, full_name, people_id, role, password_hash, must_change_password,
-      password_changed_at, created_by_user_id, created_at, updated_at
+      password_changed_at, created_by_user_id, created_via, microsoft_oid, microsoft_linked_at,
+      created_at, updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
     RETURNING user_id
     `,
     [
@@ -142,10 +177,38 @@ const insertUser = async (db, { email, fullName, peopleId, role, passwordHash, m
       Boolean(mustChangePassword),
       passwordHash ? now : null,
       createdByUserId,
+      createdVia,
+      microsoftOid,
+      microsoftOid ? now : null,
       now
     ]
   );
   return findUserById(db, result.rows[0].user_id);
+};
+
+// microsoftOid null: the account is no longer linked to a Microsoft account.
+const setMicrosoftLink = async (db, userId, { microsoftOid, now }) => {
+  await db.query(
+    `
+    UPDATE public.kpi_app_user
+    SET microsoft_oid = $2, microsoft_linked_at = $3, updated_at = $4
+    WHERE user_id = $1
+    `,
+    [userId, microsoftOid, microsoftOid ? now : null, now]
+  );
+};
+
+// A temporary password dropped at a Microsoft sign-in: the account no longer
+// has a password (the user can choose one with "Forgot your password?").
+const clearUserPassword = async (db, userId, now) => {
+  await db.query(
+    `
+    UPDATE public.kpi_app_user
+    SET password_hash = NULL, must_change_password = FALSE, password_changed_at = $2, updated_at = $2
+    WHERE user_id = $1
+    `,
+    [userId, now]
+  );
 };
 
 const updateUserProfile = async (db, userId, { fullName, peopleId, role, isActive, now }) => {
@@ -192,14 +255,15 @@ const registerFailedLogin = async (db, userId, { maxFailedLogins, lockedUntil, n
   return Number(result.rows[0]?.failed_login_count || 0);
 };
 
-const registerSuccessfulLogin = async (db, userId, now) => {
+// method: "password" or "microsoft".
+const registerSuccessfulLogin = async (db, userId, now, method = "password") => {
   await db.query(
     `
     UPDATE public.kpi_app_user
-    SET failed_login_count = 0, locked_until = NULL, last_login_at = $2, updated_at = $2
+    SET failed_login_count = 0, locked_until = NULL, last_login_at = $2, last_login_method = $3, updated_at = $2
     WHERE user_id = $1
     `,
-    [userId, now]
+    [userId, now, method]
   );
 };
 
@@ -457,6 +521,30 @@ const listAuthEvents = async (db, { userId, eventType, limit }) => {
   return result.rows;
 };
 
+// ---- settings --------------------------------------------------------------
+
+const getSetting = async (db, key) => {
+  const result = await db.query(
+    `SELECT setting_key, value, updated_by_user_id, updated_at FROM public.kpi_app_setting WHERE setting_key = $1`,
+    [key]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { ...row, value: typeof row.value === "string" ? JSON.parse(row.value) : row.value };
+};
+
+const saveSetting = async (db, { key, value, userId, now }) => {
+  await db.query(
+    `
+    INSERT INTO public.kpi_app_setting (setting_key, value, updated_by_user_id, updated_at)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (setting_key) DO UPDATE
+    SET value = EXCLUDED.value, updated_by_user_id = EXCLUDED.updated_by_user_id, updated_at = EXCLUDED.updated_at
+    `,
+    [key, JSON.stringify(value), userId || null, now]
+  );
+};
+
 // ---- people (read-only) ----------------------------------------------------
 
 const findPersonById = async (db, peopleId) => {
@@ -500,9 +588,12 @@ module.exports = {
   findUserByEmail,
   findUserById,
   findUserByPeopleId,
+  findUserByMicrosoftOid,
   insertUser,
   updateUserProfile,
   setUserPassword,
+  setMicrosoftLink,
+  clearUserPassword,
   registerFailedLogin,
   registerSuccessfulLogin,
   unlockUser,
@@ -522,6 +613,8 @@ module.exports = {
   countRecentPasswordTokens,
   insertAuthEvent,
   listAuthEvents,
+  getSetting,
+  saveSetting,
   findPersonById,
   findPersonByEmail,
   searchPeople
